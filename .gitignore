@@ -1,0 +1,18 @@
+# Environment files
+.env
+.env.local
+backend/.env
+frontend/.env.local
+
+# Python
+backend/venv/
+__pycache__/
+*.pyc
+
+# Node
+frontend/node_modules/
+frontend/.next/
+
+# OS files
+.DS_Store
+Thumbs.db
