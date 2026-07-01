@@ -5,6 +5,10 @@ from supabase import create_client, Client
 import os
 import jwt
 import requests
+import threading
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from datetime import datetime, timedelta
 
 # Load environment variables from .env file
@@ -58,7 +62,6 @@ def home():
 
 # ─────────────────────────────────────────
 # ROUTE 2: Google OAuth - Step 1
-# Redirect user to Google login page
 # ─────────────────────────────────────────
 @app.route("/auth/google")
 def google_login():
@@ -74,7 +77,6 @@ def google_login():
 
 # ─────────────────────────────────────────
 # ROUTE 3: Google OAuth - Step 2 (Callback)
-# Google sends user back here after login
 # ─────────────────────────────────────────
 @app.route("/auth/google/callback")
 def google_callback():
@@ -82,7 +84,6 @@ def google_callback():
     if not code:
         return redirect(f"{FRONTEND_URL}/login?error=no_code")
 
-    # Exchange code for access token
     token_response = requests.post(
         "https://oauth2.googleapis.com/token",
         data={
@@ -96,7 +97,6 @@ def google_callback():
     token_data = token_response.json()
     access_token = token_data.get("access_token")
 
-    # Get user info from Google
     user_info_response = requests.get(
         "https://www.googleapis.com/oauth2/v2/userinfo",
         headers={"Authorization": f"Bearer {access_token}"}
@@ -108,13 +108,11 @@ def google_callback():
     full_name = user_info.get("name")
     avatar_url = user_info.get("picture")
 
-    # Check if user exists in our database
     existing = supabase.table("users").select("*").eq("email", email).execute()
 
     if existing.data:
         user = existing.data[0]
     else:
-        # Create new user
         new_user = supabase.table("users").insert({
             "email": email,
             "full_name": full_name,
@@ -123,10 +121,7 @@ def google_callback():
         }).execute()
         user = new_user.data[0]
 
-    # Create JWT token
     token = create_token(user["id"], user["email"])
-
-    # Redirect to frontend with token
     return redirect(f"{FRONTEND_URL}/auth/callback?token={token}")
 
 # ─────────────────────────────────────────
@@ -145,7 +140,7 @@ def get_me():
     return jsonify(user.data[0])
 
 # ─────────────────────────────────────────
-# ROUTE 5: Get all users (for assign dropdown)
+# ROUTE 5: Get all users
 # ─────────────────────────────────────────
 @app.route("/users")
 def get_users():
@@ -189,14 +184,19 @@ def create_task():
 
     task = new_task.data[0]
 
-    # Send email notification if task is assigned
+    # Send email in background thread (non-blocking)
     if task.get("assigned_to"):
-        send_email_notification(task, "task_assigned")
+        thread = threading.Thread(
+            target=send_email_notification,
+            args=(task, "task_assigned")
+        )
+        thread.daemon = True
+        thread.start()
 
     return jsonify(task), 201
 
 # ─────────────────────────────────────────
-# ROUTE 8: Update task (including complete)
+# ROUTE 8: Update task
 # ─────────────────────────────────────────
 @app.route("/tasks/<task_id>", methods=["PATCH"])
 def update_task(task_id):
@@ -206,16 +206,20 @@ def update_task(task_id):
 
     data = request.get_json()
 
-    # Get old task status before update
     old_task = supabase.table("tasks").select("*").eq("id", task_id).execute()
     old_status = old_task.data[0]["status"] if old_task.data else None
 
     updated = supabase.table("tasks").update(data).eq("id", task_id).execute()
     task = updated.data[0]
 
-    # Send email if task just got completed
+    # Send email in background thread (non-blocking)
     if data.get("status") == "completed" and old_status != "completed":
-        send_email_notification(task, "task_completed")
+        thread = threading.Thread(
+            target=send_email_notification,
+            args=(task, "task_completed")
+        )
+        thread.daemon = True
+        thread.start()
 
     return jsonify(task)
 
@@ -236,7 +240,6 @@ def delete_task(task_id):
 # ─────────────────────────────────────────
 def send_email_notification(task, notification_type):
     try:
-        # Get the assigned user email
         assigned_to = task.get("assigned_to")
         if not assigned_to:
             return
@@ -250,15 +253,23 @@ def send_email_notification(task, notification_type):
 
         if notification_type == "task_assigned":
             subject = f"New Task Assigned: {task['title']}"
-            body = f"Hi {recipient_name},\n\nA new task has been assigned to you:\n\nTitle: {task['title']}\nDescription: {task.get('description', 'No description')}\nDue Date: {task.get('due_date', 'No due date')}\n\nLogin to view your tasks.\n\nHairdrama Tech"
+            body = (
+                f"Hi {recipient_name},\n\n"
+                f"A new task has been assigned to you:\n\n"
+                f"Title: {task['title']}\n"
+                f"Description: {task.get('description', 'No description')}\n"
+                f"Due Date: {task.get('due_date', 'No due date')}\n\n"
+                f"Login to view your tasks.\n\n"
+                f"Hairdrama Tech"
+            )
         else:
             subject = f"Task Completed: {task['title']}"
-            body = f"Hi {recipient_name},\n\nThe following task has been marked as completed:\n\nTitle: {task['title']}\n\nHairdrama Tech"
-
-        # Send via Gmail SMTP
-        import smtplib
-        from email.mime.text import MIMEText
-        from email.mime.multipart import MIMEMultipart
+            body = (
+                f"Hi {recipient_name},\n\n"
+                f"The following task has been marked as completed:\n\n"
+                f"Title: {task['title']}\n\n"
+                f"Hairdrama Tech"
+            )
 
         smtp_email = os.getenv("GMAIL_USER")
         smtp_password = os.getenv("GMAIL_APP_PASSWORD")
@@ -277,14 +288,13 @@ def send_email_notification(task, notification_type):
             server.login(smtp_email, smtp_password)
             server.sendmail(smtp_email, recipient_email, msg.as_string())
 
-        # Log notification in database
         supabase.table("notifications").insert({
             "task_id": task["id"],
             "sent_to": assigned_to,
             "type": notification_type
         }).execute()
 
-        print(f"Email sent to {recipient_email}")
+        print(f"Email sent successfully to {recipient_email}")
 
     except Exception as e:
         print(f"Email error: {e}")
